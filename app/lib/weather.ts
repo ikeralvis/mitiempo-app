@@ -48,25 +48,53 @@ const API_KEY = process.env.NEXT_PUBLIC_OPENWEATHER_API_KEY || '';
 export async function searchCities(query: string): Promise<City[]> {
     if (!query || query.length < 2) return [];
 
+    // cache in sessionStorage for 1 hour to avoid repeated requests
+    try {
+        if (typeof window !== 'undefined') {
+            const key = `ow_search_${query.toLowerCase()}`;
+            const raw = sessionStorage.getItem(key);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (Date.now() - parsed.ts < 1000 * 60 * 60) {
+                    return parsed.data as City[];
+                }
+            }
+        }
+    } catch {
+        // ignore cache errors
+    }
+
     try {
         const res = await fetch(
             `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(query)}&limit=5&appid=${API_KEY}`
         );
         if (!res.ok) return [];
         const data = await res.json();
-        return data.map((item: {
+        interface GeocodingApiItem {
             name: string;
             lat: number;
             lon: number;
             country: string;
             state?: string;
-        }) => ({
+        }
+        const mapped = data.map((item: GeocodingApiItem) => ({
             name: item.name,
             lat: item.lat,
             lon: item.lon,
             country: item.country,
             state: item.state,
         }));
+
+        try {
+            if (typeof window !== 'undefined') {
+                const key = `ow_search_${query.toLowerCase()}`;
+                sessionStorage.setItem(key, JSON.stringify({ ts: Date.now(), data: mapped }));
+            }
+        } catch {
+            // ignore
+        }
+
+        return mapped;
     } catch {
         return [];
     }
@@ -75,88 +103,42 @@ export async function searchCities(query: string): Promise<City[]> {
 // Obtener clima actual y pronóstico (One Call API 3.0 o fallback a 2.5)
 export async function getWeatherData(lat: number, lon: number): Promise<WeatherData | null> {
     try {
-        // Intentamos con la API gratuita (Current Weather + Forecast 5 days)
-        const [currentRes, forecastRes] = await Promise.all([
-            fetch(
-                `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&units=metric&lang=es&appid=${API_KEY}`
-            ),
-            fetch(
-                `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&units=metric&lang=es&appid=${API_KEY}`
-            ),
-        ]);
-
-        if (!currentRes.ok || !forecastRes.ok) return null;
-
-        const currentData = await currentRes.json();
-        const forecastData = await forecastRes.json();
-
-        // Procesar datos actuales
-        const current: CurrentWeather = {
-            temp: Math.round(currentData.main.temp),
-            feels_like: Math.round(currentData.main.feels_like),
-            humidity: currentData.main.humidity,
-            wind_speed: Math.round(currentData.wind.speed * 3.6), // m/s a km/h
-            description: currentData.weather[0].description,
-            icon: currentData.weather[0].icon,
-            dt: currentData.dt,
-        };
-
-        // Procesar pronóstico por horas (próximas 24 horas, cada 3 horas)
-        interface ForecastItem {
-            dt: number;
-            main: {
-                temp: number;
-            };
-            weather: {
-                icon: string;
-                description: string;
-            }[];
-            pop?: number;
+        // simple client-side rate limiting to avoid excessive calls from this client
+        if (typeof window !== 'undefined') {
+            try {
+                const rlKey = 'ow_rate_v1';
+                const raw = sessionStorage.getItem(rlKey);
+                const now = Date.now();
+                const windowMs = 60 * 1000; // 1 minute window
+                const limit = 60; // max requests per minute per client
+                let arr: number[] = raw ? JSON.parse(raw) : [];
+                arr = arr.filter((t) => now - t < windowMs);
+                if (arr.length >= limit) {
+                    // too many requests from this client recently
+                    return null;
+                }
+                arr.push(now);
+                sessionStorage.setItem(rlKey, JSON.stringify(arr));
+            } catch { }
         }
 
-        const hourly: HourlyForecast[] = forecastData.list.slice(0, 8).map((item: ForecastItem) => ({
-            dt: item.dt,
-            temp: Math.round(item.main.temp),
-            icon: item.weather[0].icon,
-            description: item.weather[0].description,
-            pop: Math.round((item.pop || 0) * 100),
-        }));
+        // Try server-side proxy endpoints to avoid exposing API key to client.
+        // Use internal API routes we created at /api/geocode and /api/weather
+        const base = '';
+        const weatherRes = await fetch(`${base}/api/weather?lat=${lat}&lon=${lon}`);
+        if (!weatherRes.ok) return null;
+        const weatherJson = await weatherRes.json();
 
-        // Procesar pronóstico por días (agrupar por día)
-        const dailyMap = new Map<string, ForecastItem[]>();
-        forecastData.list.forEach((item: ForecastItem) => {
-            const date = new Date(item.dt * 1000).toDateString();
-            if (!dailyMap.has(date)) {
-                dailyMap.set(date, []);
-            }
-            dailyMap.get(date)!.push(item);
-        });
+        // If the proxy returned an error object, handle it
+        if (weatherJson && weatherJson.error) return null;
 
-        const daily: DailyForecast[] = Array.from(dailyMap.entries())
-            .slice(0, 5)
-            .map(([_, items]) => {
-                const temps = items.map((i: ForecastItem) => i.main.temp);
-                const middayItem = items.find((i: ForecastItem) => {
-                    const hour = new Date(i.dt * 1000).getHours();
-                    return hour >= 11 && hour <= 14;
-                }) || items[0];
-
-                return {
-                    dt: items[0].dt,
-                    temp_min: Math.round(Math.min(...temps)),
-                    temp_max: Math.round(Math.max(...temps)),
-                    icon: middayItem.weather[0].icon,
-                    description: middayItem.weather[0].description,
-                    pop: Math.round(Math.max(...items.map((i: ForecastItem) => i.pop || 0)) * 100),
-                };
-            });
-
+        // The server proxy returns the final shape already (current, hourly, daily)
         return {
-            city: currentData.name,
-            country: currentData.sys.country,
-            current,
-            hourly,
-            daily,
+            city: weatherJson.city,
+            country: weatherJson.country,
+            current: weatherJson.current,
+            hourly: weatherJson.hourly,
+            daily: weatherJson.daily,
         };
     } catch (error) {
         console.error('Error fetching weather:', error);
